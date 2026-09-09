@@ -1,0 +1,338 @@
+//@version=6
+indicator("金融・REIT 財務診断 v1.1", shorttitle="FinREIT 1.1", overlay=false, precision=1, max_bars_back=500)
+// ------------------------------------------------------------------------------------------------
+// TradingView 内蔵データのみで完結（request.financial / request.splits / request.security）。
+// 外部データ・手入力・持ち越し補完なし。現在値ベースの診断であり、ポイントインタイムの検証用データではない。
+//
+// v1.0 → v1.1 の主な変更
+//  1. フロー項目（純利益・売上・CFO・普通配当）は "TTM" を直接取得。4四半期合算を廃止し、
+//     必要な連続四半期数を 8 → 5 に削減（連続性の切れによる長期欠損を大幅に減らす）。
+//  2. 四半期間隔の許容範囲を入力化（既定 60〜150 日。10-K 遅延ファイラー対応）。
+//  3. 同一四半期の項目が数日ずれて配置された場合は同じ行にマージ（既定 10 日以内）。
+//  4. 株数を request.splits の累積係数で分割・併合補正。異常倍率は「分割疑い」として欠損扱い。
+//  5. 赤字（純利益・CFO ≤ 0）で配当を出している場合は配当性向を「欠損」ではなく「不達成」に。
+//  6. 銀行・保険の資本比率は TCE（のれん・無形資産控除）を既定に。
+//  7. ROE・ROA の平均分母を 2 点 → 5 四半期平均に。
+//  8. 候補判定にヒステリシス（成立は基準以上、離脱は基準−マージン未満）。アラート連発を抑制。
+//  9. 市場比較は終値時刻ではなく「同一暦日」で照合。比較市場を取引所から自動選択（TSE/HKEX/LSE）。
+// 10. REIT の株数増加上限を独立入力に（既定 10%）。モーゲージ REIT 疑いを表に警告表示。
+// 11. 色をチャートテーマ追従（chart.fg_color）に。連続性判定を毎バー 1 回だけ計算。
+// ------------------------------------------------------------------------------------------------
+
+// ---------- 入力：モード・データ ----------
+string modeInput = input.string("自動", "採点モード", options=["自動", "銀行", "保険", "REIT（不動産保有型）"], group="モード")
+bool stopped = input.bool(false, "判定停止（モーゲージREIT・比較不能な企業等）", group="モード")
+int expiry = input.int(150, "配置日からの失効日数", minval=60, maxval=365, group="データ")
+int gapMin = input.int(60, "四半期間隔の下限日数", minval=30, maxval=90, group="データ")
+int gapMax = input.int(150, "四半期間隔の上限日数", minval=100, maxval=200, group="データ")
+int mergeDays = input.int(10, "同一四半期とみなす配置日差（日）", minval=0, maxval=30, group="データ")
+bool splitAdjust = input.bool(true, "株数を分割・併合で補正（request.splits）", group="データ")
+bool useTce = input.bool(true, "銀行・保険：資本比率はTCE（のれん・無形資産控除）", group="データ")
+
+// ---------- 入力：採点 ----------
+float minCoverage = input.float(70, "ライン最低充足率 %", minval=50, maxval=100, group="採点")
+float candidateCoverage = input.float(100, "候補最低充足率 %", minval=70, maxval=100, group="採点")
+float candidateScore = input.float(80, "候補最低点（下限）", minval=0, maxval=100, group="採点")
+float exitMargin = input.float(10, "候補離脱マージン（点）", minval=0, maxval=30, group="採点")
+float bankCapital = input.float(6, "銀行：資本/総資産の基準 %（規制比率ではない）", minval=0.1, group="銀行・保険")
+float insuranceCapital = input.float(10, "保険：資本/総資産の基準 %（規制比率ではない）", minval=0.1, group="銀行・保険")
+float bankRoe = input.float(10, "銀行：近似ROE基準 %", minval=0.1, group="銀行・保険")
+float insuranceRoe = input.float(10, "保険：近似ROE基準 %", minval=0.1, group="銀行・保険")
+float bankRoa = input.float(0.8, "銀行：ROA基準 %", minval=0.01, group="銀行・保険")
+float payoutMax = input.float(70, "銀行・保険：普通配当/純利益上限 %", minval=1, group="銀行・保険")
+float dilutionMax = input.float(3, "銀行・保険：株数増加上限 %", minval=0, group="銀行・保険")
+float reitLeverage = input.float(60, "REIT：負債/総資産上限 %", minval=1, maxval=100, group="REIT")
+float reitPayout = input.float(90, "REIT：普通配当/CFO上限 %（AFFO配当性向ではない）", minval=1, group="REIT")
+float reitDilutionMax = input.float(10, "REIT：株数増加上限 %", minval=0, group="REIT")
+
+// ---------- 入力：価格 ----------
+int declineLength = input.int(126, "下落期間（日足本数）", minval=20, maxval=400, group="価格")
+float declineMin = input.float(20, "期間内最高終値からの下落率 %", minval=0, maxval=99, group="価格")
+bool relativeRequired = input.bool(false, "市場超過下落も要求", group="価格")
+bool marketAuto = input.bool(true, "比較市場を取引所から自動選択", group="価格")
+string marketInput = input.symbol("AMEX:SPY", "比較市場（手動）", group="価格")
+float excessMin = input.float(10, "市場超過下落 pp", minval=0, group="価格")
+bool showUpper = input.bool(true, "欠損時の上限も表示", group="表示")
+
+if barstate.isfirst and (not timeframe.isdaily or timeframe.multiplier != 1 or not chart.is_standard)
+    runtime.error("標準ローソク足の1日足で使用してください。")
+
+// ---------- モード判定 ----------
+string industry = na(syminfo.industry) ? "" : syminfo.industry
+// 業種名の完全一致のみ自動判定。未対応業種は手動選択。
+bool bankAuto = industry == "Major Banks" or industry == "Regional Banks" or industry == "Savings Banks"
+bool insuranceAuto = industry == "Multi-Line Insurance" or industry == "Life/Health Insurance" or industry == "Property/Casualty Insurance" or industry == "Specialty Insurance"
+bool reitAuto = industry == "Real Estate Investment Trusts"
+string autoMode = bankAuto ? "銀行" : insuranceAuto ? "保険" : reitAuto ? "REIT（不動産保有型）" : "対象未確認"
+string mode = modeInput == "自動" ? autoMode : modeInput
+bool isBank = mode == "銀行"
+bool isInsurance = mode == "保険"
+bool isReit = mode == "REIT（不動産保有型）"
+bool eligible = (syminfo.type == "stock" or syminfo.type == "fund") and not stopped and (isBank or isInsurance or isReit)
+
+// ---------- 財務データ取得（配置日のみ値が来る gaps_on） ----------
+string sym = ticker.standard(syminfo.tickerid)
+// 列 0-5: 残高項目 FQ
+float a0 = request.financial(sym, "TOTAL_ASSETS", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a1 = request.financial(sym, "COMMON_EQUITY_TOTAL", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a2 = request.financial(sym, "TOTAL_SHARES_OUTSTANDING", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a3 = request.financial(sym, "TOTAL_DEBT", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a4 = request.financial(sym, "GOODWILL", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a5 = request.financial(sym, "INTANGIBLES_NET", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+// 列 6-9: フロー項目 TTM（TradingView 側で直近4四半期を合算済み）
+float a6 = request.financial(sym, "NET_INCOME", "TTM", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a7 = request.financial(sym, "TOTAL_REVENUE", "TTM", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a8 = request.financial(sym, "CASH_F_OPERATING_ACTIVITIES", "TTM", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float a9 = request.financial(sym, "COMMON_DIVIDENDS_CASH_FLOW", "TTM", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+// 列 10: 四半期純利益 FQ（保険の連続黒字判定用）
+float a10 = request.financial(sym, "NET_INCOME", "FQ", gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+
+// 分割・併合の累積係数（列 11）。分割バーでのみ値が来る。
+float splitNum = request.splits(sym, splits.numerator, gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+float splitDen = request.splits(sym, splits.denominator, gaps=barmerge.gaps_on, ignore_invalid_symbol=true)
+var float splitCum = 1.0
+if splitAdjust and not na(splitNum) and not na(splitDen) and splitNum > 0 and splitDen > 0
+    splitCum := splitCum * splitNum / splitDen
+
+// ---------- スナップショット行列（行 0 = 最新、最大 5 行） ----------
+int ROWS = 5
+var matrix<float> q = matrix.new<float>(0, 12, na)
+var array<int> ds = array.new_int()
+array<float> incoming = array.from(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, splitCum)
+// 新しい四半期の起点は主要3表（B/S・P/L・C/F）のいずれかの到着。
+bool anchor = not na(a0) or not na(a6) or not na(a8) or not na(a10)
+bool anyNew = false
+for c = 0 to 10
+    anyNew := anyNew or not na(array.get(incoming, c))
+if anyNew
+    bool sameQuarter = array.size(ds) > 0 and (time - array.get(ds, 0)) / 86400000.0 <= mergeDays
+    if sameQuarter
+        // 同一四半期の遅れて届いた項目を同じ行に取り込む（既存値は上書きしない）。
+        for c = 0 to 10
+            float v = array.get(incoming, c)
+            if not na(v) and na(matrix.get(q, 0, c))
+                matrix.set(q, 0, c, v)
+    else if anchor
+        matrix.add_row(q, 0, incoming)
+        array.unshift(ds, time)
+        if matrix.rows(q) > ROWS
+            matrix.remove_row(q, ROWS)
+            array.pop(ds)
+
+// 連続性：行 0..k の配置日間隔がすべて許容範囲内なら cont[k] = true。毎バー 1 回だけ計算。
+array<bool> cont = array.new_bool(ROWS, false)
+for k = 0 to ROWS - 1
+    bool ok = array.size(ds) > k
+    if ok and k > 0
+        for i = 0 to k - 1
+            float gapDays = (array.get(ds, i) - array.get(ds, i + 1)) / 86400000.0
+            ok := ok and gapDays >= gapMin and gapDays <= gapMax
+    array.set(cont, k, ok)
+
+// ---------- ヘルパー ----------
+f_q(int col, int back) =>
+    array.get(cont, back) ? matrix.get(q, back, col) : na
+f_avg5(int col) =>
+    float s = na
+    if array.get(cont, 4)
+        s := 0.0
+        for i = 0 to 4
+            s += matrix.get(q, i, col)
+        s := s / 5
+    s
+f_div(float a, float b) =>
+    not na(a) and not na(b) and b > 0 ? a / b : na
+f_ge(float a, float b) =>
+    not na(a) and not na(b) ? a >= b ? 100.0 : 0.0 : na
+f_le(float a, float b) =>
+    not na(a) and not na(b) ? a <= b ? 100.0 : 0.0 : na
+f_pos(float a) =>
+    not na(a) ? a > 0 ? 100.0 : 0.0 : na
+f_growth(float a, float b) =>
+    not na(a) and not na(b) ? b > 0 ? f_ge(a, b) : f_pos(a) : na
+// 配当性向テスト：無配は達成、赤字配当は不達成、それ以外は上限比較。
+f_payoutTest(float div, float base, float limit) =>
+    float r = na
+    if not na(div) and div == 0
+        r := 100.0
+    else if not na(div) and div > 0 and not na(base) and base <= 0
+        r := 0.0
+    else
+        r := f_le(100 * f_div(div, base), limit)
+    r
+f_num(float a) =>
+    na(a) ? "N/A" : str.tostring(a, "#.0")
+
+// ---------- 指標計算 ----------
+float assets = f_q(0, 0)
+float assets4 = f_q(0, 4)
+float equity = f_q(1, 0)
+float equity4 = f_q(1, 4)
+float sharesRaw = f_q(2, 0)
+float shares4Raw = f_q(2, 4)
+float debt = f_q(3, 0)
+float debt4 = f_q(3, 4)
+float goodwill = f_q(4, 0)
+float intangible = f_q(5, 0)
+float ni = f_q(6, 0)
+float ni4 = f_q(6, 4)
+float revenue = f_q(7, 0)
+float revenue4 = f_q(7, 4)
+float cfo = f_q(8, 0)
+float cfo4 = f_q(8, 4)
+float dividends = math.abs(f_q(9, 0))
+float cum0 = f_q(11, 0)
+float cum4 = f_q(11, 4)
+
+// 株数：前年値を分割係数で現在基準に換算。換算後も倍率が異常なら「分割疑い」として欠損扱い。
+float shares = sharesRaw
+float shares4Adj = splitAdjust and not na(cum0) and not na(cum4) and cum4 > 0 ? shares4Raw * cum0 / cum4 : shares4Raw
+float shareRatio = f_div(shares, shares4Adj)
+bool splitSuspect = not na(shareRatio) and (shareRatio > 1.8 or shareRatio < 0.55)
+float shares4 = splitSuspect ? na : shares4Adj
+
+float tce = useTce and not isReit and not na(equity) ? equity - nz(goodwill) - nz(intangible) : equity
+float capitalRatio = 100 * f_div(tce, assets)
+float roe = 100 * f_div(ni, f_avg5(1))
+float roa = 100 * f_div(ni, f_avg5(0))
+float bookShare = f_div(equity, shares)
+float bookShare4 = f_div(equity4, shares4)
+float dilution = 100 * (f_div(shares, shares4) - 1)
+float payout = 100 * f_div(dividends, ni)
+float debtRatio = 100 * f_div(debt, assets)
+float debtRatio4 = 100 * f_div(debt4, assets4)
+float cfPayout = 100 * f_div(dividends, cfo)
+float cfoShare = f_div(cfo, shares)
+float cfoShare4 = f_div(cfo4, shares4)
+float revAssets = 100 * f_div(revenue, assets)
+// モーゲージ REIT 疑い：高レバレッジかつ総資産に対する売上が極端に小さい。停止はせず警告のみ。
+bool mreitSuspect = isReit and not na(debtRatio) and not na(revAssets) and debtRatio > 75 and revAssets < 5
+
+// ---------- 8 モジュール固定採点（欠損は分母から除外、分母は常に 100） ----------
+array<float> tests = array.new_float()
+array<string> names = array.new_string()
+array<float> weights = array.new_float()
+if isReit
+    tests := array.from(f_pos(cfo), f_growth(cfoShare, cfoShare4), f_payoutTest(dividends, cfo, reitPayout), f_le(debtRatio, reitLeverage), f_pos(equity), f_growth(revenue, revenue4), f_le(dilution, reitDilutionMax), f_le(debtRatio, debtRatio4))
+    names := array.from("CFO黒字（TTM）", "CFO/株成長（分割補正）", "普通配当/CFO", "負債/総資産", "普通株資本プラス", "売上成長（TTM）", "株数増加抑制", "負債比率悪化なし")
+    weights := array.from(15.0, 20.0, 15.0, 20.0, 5.0, 10.0, 5.0, 10.0)
+else
+    float capitalMin = isBank ? bankCapital : insuranceCapital
+    float roeMin = isBank ? bankRoe : insuranceRoe
+    float stability = na
+    if array.get(cont, 3)
+        stability := 100.0
+        for i = 0 to 3
+            float profit = matrix.get(q, i, 10)
+            stability := na(stability) or na(profit) ? na : profit > 0 ? stability : 0.0
+    tests := array.from(f_ge(capitalRatio, capitalMin), f_ge(roe, roeMin), isBank ? f_ge(roa, bankRoa) : stability, f_growth(bookShare, bookShare4), f_growth(ni, ni4), f_payoutTest(dividends, ni, payoutMax), f_le(dilution, dilutionMax), f_pos(ni))
+    names := array.from(useTce ? "TCE/総資産" : "普通株資本/総資産", "近似ROE（5Q平均）", isBank ? "ROA（5Q平均）" : "4四半期連続黒字", "簿価/株維持（分割補正）", "純利益成長・黒字転換", "普通配当/純利益", "株数増加抑制", "年間黒字（TTM）")
+    weights := isBank ? array.from(20.0, 15.0, 15.0, 15.0, 10.0, 10.0, 5.0, 10.0) : array.from(20.0, 15.0, 20.0, 15.0, 10.0, 10.0, 5.0, 5.0)
+
+float lowerRaw = 0
+float coverage = 0
+string missing = ""
+for i = 0 to 7
+    float x = array.get(tests, i)
+    if not na(x)
+        lowerRaw += x * array.get(weights, i) / 100
+        coverage += array.get(weights, i)
+    else
+        missing += (missing == "" ? "" : " / ") + array.get(names, i)
+
+int feed = array.size(ds) > 0 ? array.get(ds, 0) : na
+float age = not na(feed) ? (time - feed) / 86400000.0 : na
+bool fresh = not na(age) and age >= 0 and age <= expiry
+bool ready = eligible and fresh and coverage >= minCoverage
+float lower = ready ? lowerRaw : na
+float upper = ready ? math.min(100, lowerRaw + 100 - coverage) : na
+
+// ハードゲート：欠損では通過できない。
+bool core = isReit ? cfo > 0 and equity > 0 and debtRatio <= reitLeverage and (dividends == 0 or cfPayout <= reitPayout) : ni > 0 and equity > 0 and capitalRatio >= (isBank ? bankCapital : insuranceCapital)
+// ヒステリシス：成立は基準以上、維持は基準−マージン以上。
+bool candBase = ready and coverage >= candidateCoverage and core
+bool candEnter = candBase and lower >= candidateScore
+bool candStay = candBase and lower >= candidateScore - exitMargin
+var bool financialCandidate = false
+financialCandidate := candEnter or (financialCandidate and candStay)
+
+// ---------- 価格条件 ----------
+float peak = ta.highest(close, declineLength)
+float drawdown = bar_index >= declineLength - 1 ? 100 * f_div(close - peak, peak) : na
+float stockReturn = 100 * (f_div(close, close[declineLength]) - 1)
+string marketSym = not marketAuto ? marketInput : syminfo.prefix == "TSE" ? "TSE:1306" : syminfo.prefix == "HKEX" ? "HKEX:2800" : syminfo.prefix == "LSE" ? "LSE:ISF" : "AMEX:SPY"
+float relativeReturn = na
+if relativeRequired
+    [mc, mp, mt] = request.security(marketSym, "1D", [close, close[declineLength], time], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    // 終値時刻の一致ではなく同一暦日（チャート銘柄の取引所時間帯）で照合。
+    bool sameDay = not na(mt) and year(mt) == year and month(mt) == month and dayofmonth(mt) == dayofmonth
+    relativeReturn := sameDay ? stockReturn - 100 * (f_div(mc, mp) - 1) : na
+bool priceReady = not na(drawdown) and (not relativeRequired or not na(relativeReturn))
+bool priceCondition = priceReady and drawdown <= -declineMin and (not relativeRequired or relativeReturn <= -excessMin)
+bool combined = financialCandidate and priceCondition
+
+string status = not eligible ? "対象未確認・停止（モード確認）" : not fresh ? "配置履歴不足・失効" : not ready ? "採点データ不足" : coverage < 100 ? "欠損あり・下限～上限" : "取得済み項目の条件達成点"
+
+// ---------- 描画 ----------
+color ink = chart.fg_color
+plot(lower, "価格非依存 財務スコア下限", color=ink, linewidth=3, style=plot.style_linebr)
+plot(showUpper and coverage < 100 ? upper : na, "欠損時上限", color=color.new(ink, 60), style=plot.style_linebr)
+hline(80, "80", color=color.new(color.lime, 50))
+hline(60, "60", color=color.new(color.orange, 50))
+hline(0, "0", color=color.new(color.gray, 70))
+hline(100, "100", color=color.new(color.gray, 70))
+plot(coverage, "配点充足率 %", display=display.data_window)
+plot(financialCandidate ? 1 : 0, "財務候補", display=display.data_window)
+plot(combined ? 1 : 0, "財務＋下落候補", display=display.data_window)
+plot(drawdown, "最高終値からの下落 %", display=display.data_window)
+plot(relativeReturn, "市場超過騰落 pp", display=display.data_window)
+plot(dilution, "株数増加 %（分割補正）", display=display.data_window)
+
+// ---------- アラート（終値確定のみ） ----------
+bool confirmed = barstate.isconfirmed
+alertcondition(confirmed and financialCandidate and not financialCandidate[1], "財務候補へ移行", "{{ticker}} 金融・REIT簡易財務条件成立。規制健全性の判定ではありません。")
+alertcondition(confirmed and not financialCandidate and financialCandidate[1], "財務候補から離脱", "{{ticker}} 財務条件離脱・欠損・失効を確認。")
+alertcondition(confirmed and combined and not combined[1], "財務＋下落候補へ移行", "{{ticker}} 財務条件と価格下落条件が成立。")
+alertcondition(confirmed and not combined and combined[1], "財務＋下落候補から離脱", "{{ticker}} 財務または下落条件から離脱。")
+
+// ---------- パネル ----------
+var table panel = table.new(position.top_right, 3, 18, bgcolor=color.new(chart.bg_color, 10), frame_color=color.gray, frame_width=1)
+f_cell(int col, int row, string txt, color c) =>
+    table.cell(panel, col, row, txt, text_color=c, text_size=size.small, text_halign=text.align_left)
+if barstate.islast
+    table.clear(panel, 0, 0, 2, 17)
+    f_cell(0, 0, syminfo.ticker + " / " + mode, ink)
+    table.cell(panel, 1, 0, f_num(lower), text_color=ink, text_size=size.large)
+    f_cell(2, 0, "/100 " + status, ink)
+    f_cell(0, 1, "充足 " + f_num(coverage) + "%", color.aqua)
+    f_cell(1, 1, "上限 " + f_num(upper), color.aqua)
+    f_cell(2, 1, "異業種モード間の点数比較不可", color.orange)
+    for i = 0 to 7
+        float x = array.get(tests, i)
+        f_cell(0, i + 2, array.get(names, i), ink)
+        f_cell(1, i + 2, not eligible or not fresh ? "停止" : f_num(x), na(x) ? color.gray : x == 100 ? color.lime : color.orange)
+        f_cell(2, i + 2, "配点 " + f_num(array.get(weights, i)), color.silver)
+    f_cell(0, 10, "独立財務候補", ink)
+    f_cell(1, 10, financialCandidate ? (candEnter ? "成立" : "成立維持（マージン内）") : "未成立・保留", financialCandidate ? color.lime : color.orange)
+    f_cell(2, 10, "成立 " + f_num(candidateScore) + " / 離脱 " + f_num(candidateScore - exitMargin) + " / 充足 " + f_num(candidateCoverage) + "%", color.silver)
+    f_cell(0, 11, "財務＋下落", ink)
+    f_cell(1, 11, combined ? "成立" : not priceReady ? "価格データ不足" : "未成立", combined ? color.lime : color.orange)
+    f_cell(2, 11, "高値比 " + f_num(drawdown) + "% / 市場差 " + (relativeRequired ? f_num(relativeReturn) + " (" + marketSym + ")" : "OFF"), color.silver)
+    f_cell(0, 12, "配置日・保存", ink)
+    f_cell(1, 12, na(feed) ? "N/A" : str.format_time(feed, "yyyy-MM-dd"), color.silver)
+    f_cell(2, 12, f_num(age) + "日 / " + str.tostring(array.size(ds)) + "Q（最大" + str.tostring(ROWS) + "・公表日ではない）", color.silver)
+    f_cell(0, 13, "不足項目", color.orange)
+    f_cell(1, 13, missing == "" ? "なし" : missing, color.orange)
+    f_cell(2, 13, "残高FQ・フローTTM / 間隔 " + str.tostring(gapMin) + "〜" + str.tostring(gapMax) + "日", color.silver)
+    f_cell(0, 14, "評価対象外", color.orange)
+    f_cell(1, 14, isReit ? "FFO/AFFO・稼働率・借換期限" : isBank ? "CET1・不良債権・預金流出" : "引受成績・規制資本・準備金適正性", color.orange)
+    f_cell(2, 14, "規制上の安全性・売買推奨を示さない", color.orange)
+    f_cell(0, 15, "業種確認", ink)
+    f_cell(1, 15, industry, color.silver)
+    f_cell(2, 15, mreitSuspect ? "モーゲージREIT疑い（負債比>75%・売上/資産<5%）→手動停止を検討" : isReit ? "モーゲージREITは手動停止してください" : "自動未対応は手動で適切なモードを選択", mreitSuspect ? color.red : color.orange)
+    f_cell(0, 16, "主要実数", ink)
+    f_cell(1, 16, isReit ? "CFO配当率 " + f_num(cfPayout) + "% / 負債比 " + f_num(debtRatio) + "%" : "ROE " + f_num(roe) + "% / 資本比 " + f_num(capitalRatio) + "%", color.silver)
+    f_cell(2, 16, "日中暫定・アラートは終値確定", color.silver)
+    f_cell(0, 17, "株数・分割", ink)
+    f_cell(1, 17, splitSuspect ? "分割疑い（倍率 " + f_num(shareRatio) + "）→株数系を欠損扱い" : "前年比 " + f_num(dilution) + "%" + (splitAdjust ? "（分割補正ON）" : "（補正OFF）"), splitSuspect ? color.red : color.silver)
+    f_cell(2, 17, "TradingView内蔵データのみ・外部補完なし", color.silver)
